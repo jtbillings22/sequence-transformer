@@ -208,6 +208,59 @@ def plot_type_error_history(history, output_path="error_history.png"):
 # 6. Multi-step prediction (autoregressive using deltas)
 # ============================================
 
+def predictions(model_path="results/transformer_model.pt", dataset_path="seq_dataset.txt", context_ratio=0.8, selected_types=None):
+    if plt is None:
+        print("matplotlib not available; skipping prediction plots.")
+        return
+
+    sequences, mn_list, std_list, seq_types = load_sequences_from_txt(dataset_path, selected_types, return_types=True)
+    if len(sequences) == 0:
+        print("No sequences available for predictions.")
+        return
+
+    type_to_first_idx = {}
+    for idx, t_name in enumerate(seq_types):
+        if t_name not in type_to_first_idx:
+            type_to_first_idx[t_name] = idx
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = Transformer().to(device)
+    if not os.path.exists(model_path):
+        print(f"Model file not found: {model_path}")
+        return
+    model.load_state_dict(torch.load(model_path, map_location=device))
+
+    os.makedirs("results", exist_ok=True)
+    for type_name, seq_idx in type_to_first_idx.items():
+        seq = sequences[seq_idx]
+        if len(seq) < 2:
+            continue
+        mn, std = mn_list[seq_idx], std_list[seq_idx]
+        split = int(len(seq) * context_ratio)
+        split = min(max(split, 1), len(seq) - 1)  # ensure at least one future step
+
+        context = seq[:split]
+        steps = len(seq) - split
+        preds = predict_future(model, context, steps, mn, std, device)
+
+        true_vals = denormalize(seq, mn, std)
+        pred_series = np.concatenate([true_vals[:split], np.array(preds, dtype=np.float32)])
+
+        plt.figure(figsize=(8, 4))
+        plt.plot(true_vals, label="True")
+        plt.plot(pred_series, linestyle="--", label="Predicted")
+        plt.axvline(split - 1, color="gray", linestyle=":", label="Context end")
+        plt.title(f"{type_name} predictions")
+        plt.xlabel("Step")
+        plt.ylabel("Value")
+        plt.legend()
+        plt.tight_layout()
+
+        output_path = os.path.join("results", f"{type_name}_predictions.png")
+        plt.savefig(output_path)
+        plt.close()
+        print(f"Saved prediction plot for {type_name} to: {output_path}")
+
 def predict_future(model, initial_seq, steps, mn, std, device):
     model.eval()
     seq = initial_seq.copy()
@@ -230,6 +283,7 @@ def predict_future(model, initial_seq, steps, mn, std, device):
 
 if __name__ == "__main__":
 
+   
     # types included to train on
     selected_types = [
         "constant",
@@ -245,6 +299,7 @@ if __name__ == "__main__":
 
     # (normalized sequences, mean, standard deviation)
     sequences, mn_list, std_list, seq_types = load_sequences_from_txt("seq_dataset.txt", selected_types, return_types=True) 
+    
     print(f"Loaded {len(sequences)} sequences")
     type_names = list(selected_types)
     type_to_idx = {name: idx for idx, name in enumerate(type_names)}
@@ -254,7 +309,7 @@ if __name__ == "__main__":
     print(f"Training samples: {len(X)}")
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, type_error_history = train_model(X, Y, type_ids, type_names, batch_size=64, epochs=10, lr=1e-4)
+    model, type_error_history = train_model(X, Y, type_ids, type_names, batch_size=512, epochs=10, lr=1e-4)
 
     # save training errors results, as well as trained model to "results" folder
     
@@ -264,6 +319,7 @@ if __name__ == "__main__":
     torch.save(model.state_dict(), model_path)
     print(f"Saved model state_dict to: {model_path}")
 
+   
 
     print("\n==================== PREDICTIONS ====================\n")
 
@@ -278,3 +334,7 @@ if __name__ == "__main__":
         print(f"Initial sequence: {denormalize(initial_seq, mn, std)}")
         print(f"Predicted next {future_steps} steps: {np.round(preds, 4)}")
         print("-" * 50)
+    
+
+
+
