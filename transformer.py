@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+import os
 import numpy as np
 try:
     import matplotlib.pyplot as plt
@@ -130,7 +131,7 @@ class Transformer(nn.Module):
 # 5. Training
 # ============================================
 
-def train_model(X, Y, type_ids, type_names, batch_size=2048, epochs=15, lr=1e-4):
+def train_model(X, Y, type_ids, type_names, batch_size=4096, epochs=15, lr=1e-4):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Using device:", device)
 
@@ -227,8 +228,6 @@ def predict_future(model, initial_seq, steps, mn, std, device):
 # 7. Main
 # ============================================
 
-#TODO: so i updated the input so we can select a subset of sequences from the seq_dataset, update this main so we can choose which sequences to run as input
-
 if __name__ == "__main__":
 
     # types included to train on
@@ -241,7 +240,7 @@ if __name__ == "__main__":
         "arithmetic",
         "fibonacci",
         "noisy_sinusoidal",
-        "quadratic",
+        "quadratic"
     ]
 
     # (normalized sequences, mean, standard deviation)
@@ -257,7 +256,14 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, type_error_history = train_model(X, Y, type_ids, type_names, batch_size=64, epochs=10, lr=1e-4)
 
-    plot_type_error_history(type_error_history)
+    # save training errors results, as well as trained model to "results" folder
+    
+    os.makedirs("results", exist_ok=True)
+    plot_type_error_history(type_error_history, output_path=os.path.join("results", "error_history.png"))
+    model_path = os.path.join("results", "transformer_model.pt")
+    torch.save(model.state_dict(), model_path)
+    print(f"Saved model state_dict to: {model_path}")
+
 
     print("\n==================== PREDICTIONS ====================\n")
 
