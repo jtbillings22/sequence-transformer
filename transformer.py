@@ -105,24 +105,38 @@ def create_training_samples(sequences, seq_len=30, types=None, type_to_idx=None)
 # ============================================
 
 class Transformer(nn.Module):
-    def __init__(self, d_model=128, nhead=4, num_layers=2):
+    def __init__(self, num_types, d_model=128, nhead=4, num_layers=2, max_len=512):
         super().__init__()
         self.input_proj = nn.Linear(1, d_model)
-        self.pos_embedding = nn.Parameter(torch.randn(1, 500, d_model))
+        self.type_embedding = nn.Embedding(num_types, d_model)
+        self.register_buffer("pos_embedding", self._build_sinusoidal_pos_embedding(max_len, d_model))
         layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=256,
             dropout=0.1,
-            batch_first=True
+            batch_first=True,
         )
         self.transformer = nn.TransformerEncoder(layer, num_layers=num_layers)
-        self.fc_out = nn.Linear(d_model, 1)  # Linear output, no sigmoid
+        self.fc_out = nn.Linear(d_model, 1)
 
-    def forward(self, x):
-        x = x.unsqueeze(-1)  # (batch, seq_len, 1)
+    @staticmethod
+    def _build_sinusoidal_pos_embedding(max_len, d_model):
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe
+
+    def forward(self, x, type_ids):
+        # x: (batch, seq_len), type_ids: (batch,)
+        x = x.unsqueeze(-1)
         x = self.input_proj(x)
-        x = x + self.pos_embedding[:, :x.size(1), :]
+        seq_len = x.size(1)
+        x = x + self.pos_embedding[:seq_len].unsqueeze(0)
+        type_emb = self.type_embedding(type_ids).unsqueeze(1)
+        x = x + type_emb
         h = self.transformer(x)
         last = h[:, -1, :]
         return self.fc_out(last).squeeze(-1)
@@ -131,15 +145,28 @@ class Transformer(nn.Module):
 # 5. Training
 # ============================================
 
-def train_model(X, Y, type_ids, type_names, batch_size=4096, epochs=15, lr=1e-4):
+def train_model(X, Y, type_ids, type_names, batch_size=128, epochs=20, lr=3e-4, val_split=0.1, weight_decay=1e-2, max_grad_norm=1.0):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Using device:", device)
 
     dataset = TensorDataset(X, Y, type_ids)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=0)
+    if len(dataset) > 1 and val_split > 0:
+        val_size = max(1, int(len(dataset) * val_split))
+        train_size = len(dataset) - val_size
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            dataset,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(42),
+        )
+    else:
+        train_dataset, val_dataset = dataset, None
 
-    model = Transformer().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=0) if val_dataset else None
+
+    model = Transformer(num_types=len(type_names)).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     loss_fn = nn.MSELoss()
     type_history = {name: [] for name in type_names} # used to build error per type graph
     num_types = len(type_names)
@@ -150,15 +177,16 @@ def train_model(X, Y, type_ids, type_names, batch_size=4096, epochs=15, lr=1e-4)
         per_type_sum = [0.0] * num_types
         per_type_count = [0] * num_types
 
-        for batch_x, batch_y, batch_type in loader:
+        for batch_x, batch_y, batch_type in train_loader:
             batch_x = batch_x.to(device, non_blocking=True)
             batch_y = batch_y.to(device, non_blocking=True)
             batch_type = batch_type.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            pred = model(batch_x)
+            pred = model(batch_x, batch_type)
             loss = loss_fn(pred, batch_y)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
             total_loss += loss.item() * batch_x.size(0)
 
@@ -181,8 +209,29 @@ def train_model(X, Y, type_ids, type_names, batch_size=4096, epochs=15, lr=1e-4)
         for name, mse in zip(type_names, per_type_mse):
             type_history[name].append(mse)
 
+        val_loss = None
+        if val_loader:
+            model.eval()
+            v_total = 0
+            v_count = 0
+            with torch.no_grad():
+                for batch_x, batch_y, batch_type in val_loader:
+                    batch_x = batch_x.to(device, non_blocking=True)
+                    batch_y = batch_y.to(device, non_blocking=True)
+                    batch_type = batch_type.to(device, non_blocking=True)
+                    pred = model(batch_x, batch_type)
+                    loss = loss_fn(pred, batch_y)
+                    v_total += loss.item() * batch_x.size(0)
+                    v_count += batch_x.size(0)
+            val_loss = v_total / max(v_count, 1)
+
+        scheduler.step()
+
         per_type_str = " | ".join(f"{name}: {mse:.6f}" if not np.isnan(mse) else f"{name}: nan" for name, mse in zip(type_names, per_type_mse))
-        print(f"Epoch {epoch}/{epochs} - Loss: {avg:.6f} | Per-type MSE -> {per_type_str}")
+        if val_loss is not None:
+            print(f"Epoch {epoch}/{epochs} - Train Loss: {avg:.6f} - Val Loss: {val_loss:.6f} | Per-type MSE -> {per_type_str}")
+        else:
+            print(f"Epoch {epoch}/{epochs} - Train Loss: {avg:.6f} | Per-type MSE -> {per_type_str}")
 
     return model, type_history
 
@@ -223,8 +272,11 @@ def predictions(model_path="results/transformer_model.pt", dataset_path="seq_dat
         if t_name not in type_to_first_idx:
             type_to_first_idx[t_name] = idx
 
+    type_names = list(type_to_first_idx.keys())
+    type_to_idx = {name: i for i, name in enumerate(type_names)}
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = Transformer().to(device)
+    model = Transformer(num_types=len(type_names)).to(device)
     if not os.path.exists(model_path):
         print(f"Model file not found: {model_path}")
         return
@@ -241,7 +293,8 @@ def predictions(model_path="results/transformer_model.pt", dataset_path="seq_dat
 
         context = seq[:split]
         steps = len(seq) - split
-        preds = predict_future(model, context, steps, mn, std, device)
+        type_id = type_to_idx[type_name]
+        preds = predict_future(model, context, steps, mn, std, device, type_id)
 
         true_vals = denormalize(seq, mn, std)
         pred_series = np.concatenate([true_vals[:split], np.array(preds, dtype=np.float32)])
@@ -261,16 +314,17 @@ def predictions(model_path="results/transformer_model.pt", dataset_path="seq_dat
         plt.close()
         print(f"Saved prediction plot for {type_name} to: {output_path}")
 
-def predict_future(model, initial_seq, steps, mn, std, device):
+def predict_future(model, initial_seq, steps, mn, std, device, type_id):
     model.eval()
     seq = initial_seq.copy()
     preds = []
 
     with torch.no_grad():
         seq_len = len(initial_seq)
+        type_tensor = torch.tensor([type_id], device=device, dtype=torch.long)
         for _ in range(steps):
             x = torch.tensor(seq[-seq_len:], dtype=torch.float32).unsqueeze(0).to(device)
-            delta = model(x).cpu().item()
+            delta = model(x, type_tensor).cpu().item()
             next_val = seq[-1] + delta
             preds.append(denormalize(next_val, mn, std))
             seq = np.append(seq, next_val)  # autoregressive step in normalized space
@@ -309,7 +363,9 @@ if __name__ == "__main__":
     print(f"Training samples: {len(X)}")
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, type_error_history = train_model(X, Y, type_ids, type_names, batch_size=512, epochs=10, lr=1e-4)
+    model, type_error_history = train_model(
+        X, Y, type_ids, type_names, batch_size=128, epochs=20, lr=3e-4, val_split=0.1
+    )
 
     # save training errors results, as well as trained model to "results" folder
     
@@ -326,11 +382,13 @@ if __name__ == "__main__":
     max_predictions = 50
     for idx, seq in enumerate(sequences[:max_predictions]):
         mn, std = mn_list[idx], std_list[idx]
+        seq_type = seq_types[idx]
+        type_id = type_to_idx[seq_type]
         initial_seq = seq[:seq_len]
         future_steps = 5
-        preds = predict_future(model, initial_seq, future_steps, mn, std, device)
+        preds = predict_future(model, initial_seq, future_steps, mn, std, device, type_id)
 
-        print(f"Sequence {idx + 1}:")
+        print(f"Sequence {idx + 1} ({seq_type}):")
         print(f"Initial sequence: {denormalize(initial_seq, mn, std)}")
         print(f"Predicted next {future_steps} steps: {np.round(preds, 4)}")
         print("-" * 50)
