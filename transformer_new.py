@@ -7,6 +7,7 @@ try:
     import matplotlib.pyplot as plt
 except ImportError:
     plt = None
+import os
 
 # ============================================
 # 1. Normalization: mean/std per sequence
@@ -128,7 +129,7 @@ def create_training_samples(sequences, seq_len=30, types=None, type_to_idx=None)
 # 4. Enhanced Transformer with type embeddings and multi-head prediction
 # ============================================
 
-class ImprovedTransformer(nn.Module):
+class Transformer(nn.Module):
     def __init__(self, d_model=256, nhead=8, num_layers=6, num_types=10, dropout=0.1):
         super().__init__()
         self.d_model = d_model
@@ -224,7 +225,7 @@ def train_model(X, Y_delta, Y_ratio, Y_direct, type_ids, type_names,
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, 
                        pin_memory=True, num_workers=0)
 
-    model = ImprovedTransformer(num_types=len(type_names)).to(device)
+    model = Transformer(num_types=len(type_names)).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     
     # Cosine annealing scheduler for better convergence
@@ -294,7 +295,6 @@ def train_model(X, Y_delta, Y_ratio, Y_direct, type_ids, type_names,
 
     return model, type_history
 
-
 def plot_type_error_history(history, output_path="error_history.png"):
     if plt is None:
         print("matplotlib not available; skipping per-type error plot.")
@@ -350,6 +350,65 @@ def predict_future(model, initial_seq, steps, mn, std, device, type_id):
 
     return preds
 
+# plot predictions and save to results
+def predictions(model_path="results/transformer_model.pt", dataset_path="seq_dataset.txt", context_ratio=0.8, selected_types=None):
+    if plt is None:
+        print("matplotlib not available; skipping prediction plots.")
+        return
+
+    sequences, mn_list, std_list, seq_types = load_sequences_from_txt(dataset_path, selected_types, return_types=True)
+    if len(sequences) == 0:
+        print("No sequences available for predictions.")
+        return
+
+    type_to_first_idx = {}
+    for idx, t_name in enumerate(seq_types):
+        if t_name not in type_to_first_idx:
+            type_to_first_idx[t_name] = idx
+
+    type_names = list(type_to_first_idx.keys())
+    type_to_idx = {name: i for i, name in enumerate(type_names)}
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = Transformer(num_types=len(type_names)).to(device)
+    if not os.path.exists(model_path):
+        print(f"Model file not found: {model_path}")
+        return
+    model.load_state_dict(torch.load(model_path, map_location=device))
+
+    os.makedirs("results", exist_ok=True)
+    for type_name, seq_idx in type_to_first_idx.items():
+        seq = sequences[seq_idx]
+        if len(seq) < 2:
+            continue
+        mn, std = mn_list[seq_idx], std_list[seq_idx]
+        split = int(len(seq) * context_ratio)
+        split = min(max(split, 1), len(seq) - 1)  # ensure at least one future step
+
+        context = seq[:split]
+        steps = len(seq) - split
+        type_id = type_to_idx[type_name]
+        preds = predict_future(model, context, steps, mn, std, device, type_id)
+
+        true_vals = denormalize(seq, mn, std)
+        pred_series = np.concatenate([true_vals[:split], np.array(preds, dtype=np.float32)])
+
+        plt.figure(figsize=(8, 4))
+        plt.plot(true_vals, label="True")
+        plt.plot(pred_series, linestyle="--", label="Predicted")
+        plt.axvline(split - 1, color="gray", linestyle=":", label="Context end")
+        plt.title(f"{type_name} predictions")
+        plt.xlabel("Step")
+        plt.ylabel("Value")
+        plt.legend()
+        plt.tight_layout()
+
+        output_path = os.path.join("results", f"{type_name}_predictions.png")
+        plt.savefig(output_path)
+        plt.close()
+        print(f"Saved prediction plot for {type_name} to: {output_path}")
+
+
 # ============================================
 # 7. Main
 # ============================================
@@ -367,6 +426,7 @@ if __name__ == "__main__":
         "fibonacci",
         "noisy_sinusoidal",
         "quadratic",
+        "geometric"
     ]
 
     # Load sequences
@@ -382,14 +442,17 @@ if __name__ == "__main__":
         sequences, seq_len=seq_len, types=seq_types, type_to_idx=type_to_idx
     )
     print(f"Training samples: {len(X)}")
-    
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, type_error_history = train_model(
         X, Y_delta, Y_ratio, Y_direct, type_ids, type_names, 
         batch_size=256, epochs=10, lr=1e-4
     )
 
+    model_path = os.path.join("results", "transformer_model.pt")
+    torch.save(model.state_dict(), model_path)
+
     plot_type_error_history(type_error_history)
+    predictions(model_path, selected_types=selected_types)
 
     print("\n==================== PREDICTIONS ====================\n")
 
