@@ -9,9 +9,7 @@ except ImportError:
     plt = None
 import os
 
-# ============================================
-# 1. Normalization: mean/std per sequence
-# ============================================
+# Normalize the dataset to zero mean
 
 def normalize_sequences(data):
     """Normalize each sequence to zero mean, unit std"""
@@ -24,9 +22,7 @@ def normalize_sequences(data):
 def denormalize(value, mn, std):
     return value * std + mn
 
-# ============================================
-# 2. Load sequences from dataset file
-# ============================================
+# load generated sequences 
 
 def load_sequences_from_txt(filename: str, types=None, return_types: bool = False):
     """
@@ -67,9 +63,7 @@ def load_sequences_from_txt(filename: str, types=None, return_types: bool = Fals
         return norm_data, mn, std, seq_types
     return norm_data, mn, std
 
-# ============================================
-# 3. Build training windows with richer features
-# ============================================
+# Creates training window examples with fixed length 30
 
 def create_training_samples(sequences, seq_len=30, types=None, type_to_idx=None):
     """
@@ -86,7 +80,7 @@ def create_training_samples(sequences, seq_len=30, types=None, type_to_idx=None)
         windows = np.lib.stride_tricks.sliding_window_view(seq, window_shape=seq_len)
         X_list.append(windows[:-1])
         
-        # Multiple targets for better learning
+        # multiple targets for better learning
         last_vals = seq[seq_len - 1:-1]
         next_vals = seq[seq_len:]
         
@@ -94,14 +88,13 @@ def create_training_samples(sequences, seq_len=30, types=None, type_to_idx=None)
         deltas = next_vals - last_vals
         Y_delta_list.append(deltas)
         
-        # Ratio (with safety for division by zero)
         # ratios = np.where(np.abs(last_vals) > 1e-8, next_vals / last_vals, 1.0)
-        eps = 1e-8
+        eps = 1e-8 # epsilon in case of 0
         ratios = next_vals / (last_vals + eps)
 
         Y_ratio_list.append(ratios)
         
-        # Direct value
+        # direct value
         Y_direct_list.append(next_vals)
         
         if types is not None:
@@ -125,25 +118,23 @@ def create_training_samples(sequences, seq_len=30, types=None, type_to_idx=None)
             torch.tensor(Y_direct, dtype=torch.float32),
             type_tensor)
 
-# ============================================
-# 4. Enhanced Transformer with type embeddings and multi-head prediction
-# ============================================
+# Transformer network with type embeddings as an attempt to enhance predictions
 
 class Transformer(nn.Module):
     def __init__(self, d_model=256, nhead=8, num_layers=6, num_types=10, dropout=0.1):
         super().__init__()
         self.d_model = d_model
         
-        # Input projection with richer features
+        # Input projection 
         self.input_proj = nn.Linear(1, d_model)
         
-        # Type-aware embedding
+        # Type embeddings
         self.type_embedding = nn.Embedding(num_types, d_model)
         
         # Learnable positional encoding
         self.pos_embedding = nn.Parameter(torch.randn(1, 500, d_model) * 0.02)
         
-        # Deeper transformer with more capacity
+        #  Transformer config
         layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -176,12 +167,13 @@ class Transformer(nn.Module):
             nn.Linear(d_model // 2, 1)
         )
         
-        # Gating mechanism to weight predictions
+        # Prediction weights
         self.gate = nn.Sequential(
             nn.Linear(d_model, 3),
-            nn.Softmax(dim=-1)
+            nn.Softmax(dim=-1) # w softmax, our ml glorious king
         )
-
+    
+    # Feed forward function
     def forward(self, x, type_ids):
         batch_size, seq_len = x.shape
         
@@ -189,7 +181,7 @@ class Transformer(nn.Module):
         x = x.unsqueeze(-1)  # (batch, seq_len, 1)
         x = self.input_proj(x)
         
-        # Add type embedding (broadcast across sequence)
+        # Add type embedding
         type_emb = self.type_embedding(type_ids).unsqueeze(1)  # (batch, 1, d_model)
         x = x + type_emb
         
@@ -207,14 +199,12 @@ class Transformer(nn.Module):
         ratio = self.ratio_head(last).squeeze(-1)
         direct = self.direct_head(last).squeeze(-1)
         
-        # Gate weights
+        # Gate weights (combines 3 prediction heads and outputs 3dim weighted vector)
         gates = self.gate(last)  # (batch, 3)
         
         return delta, ratio, direct, gates
 
-# ============================================
-# 5. Training with multi-objective loss
-# ============================================
+# Training loop, base config as; 256 batches, 10 epochs, and 1e-4 learning rate
 
 def train_model(X, Y_delta, Y_ratio, Y_direct, type_ids, type_names, 
                 batch_size=256, epochs=10, lr=1e-4):
@@ -228,13 +218,14 @@ def train_model(X, Y_delta, Y_ratio, Y_direct, type_ids, type_names,
     model = Transformer(num_types=len(type_names)).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     
-    # Cosine annealing scheduler for better convergence
+    # Scheduler to improve convergence, using cosinseAnealing
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     
     loss_fn = nn.MSELoss()
     type_history = {name: [] for name in type_names}
     num_types = len(type_names)
 
+    # Core training loop
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0
@@ -295,9 +286,11 @@ def train_model(X, Y_delta, Y_ratio, Y_direct, type_ids, type_names,
 
     return model, type_history
 
+# Using history data from training, plots graph of error history
+
 def plot_type_error_history(history, output_path="error_history.png"):
     if plt is None:
-        print("matplotlib not available; skipping per-type error plot.")
+        print("matplotlib not available; skipping")
         return
     plt.figure(figsize=(10, 6))
     epochs = range(1, len(next(iter(history.values()))) + 1)
@@ -314,10 +307,8 @@ def plot_type_error_history(history, output_path="error_history.png"):
     plt.close()
     print(f"Saved per-type error plot to: {output_path}")
 
-# ============================================
-# 6. Enhanced multi-step prediction
-# ============================================
-
+# Multi-step prediction
+ 
 def predict_future(model, initial_seq, steps, mn, std, device, type_id):
     model.eval()
     seq = initial_seq.copy()
@@ -350,7 +341,8 @@ def predict_future(model, initial_seq, steps, mn, std, device, type_id):
 
     return preds
 
-# plot predictions and save to results
+# Draw sample from each type, make predictions and plot then save to results
+
 def predictions(model_path="results/transformer_model.pt", dataset_path="seq_dataset.txt", context_ratio=0.8, selected_types=None):
     if plt is None:
         print("matplotlib not available; skipping prediction plots.")
@@ -408,14 +400,11 @@ def predictions(model_path="results/transformer_model.pt", dataset_path="seq_dat
         plt.close()
         print(f"Saved prediction plot for {type_name} to: {output_path}")
 
-
-# ============================================
-# 7. Main
-# ============================================
+# Main
 
 if __name__ == "__main__":
 
-    # types included to train on
+    # Types included to train on
     selected_types = [
         "constant",
         "linear",
